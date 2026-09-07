@@ -180,6 +180,95 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
+def _copy_expert_tensor_(
+    destination_tensor: torch.Tensor, source_tensor: torch.Tensor
+) -> None:
+    if destination_tensor.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.utils import (
+            copy_npu_formatted_tensor_,
+            is_npu_internal_format_tensor,
+        )
+
+        if is_npu_internal_format_tensor(destination_tensor):
+            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
+            return
+    destination_tensor.copy_(source_tensor)
+
+
+def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "npu" and tensor.storage_offset() != 0
+
+
+def _new_npu_offset_zero_staging_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Allocate standalone NPU storage without changing the tensor format."""
+    import torch_npu
+
+    source_format = torch_npu.get_npu_format(tensor)
+    staged = torch_npu.empty_with_format(
+        tuple(tensor.shape),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        acl_format=source_format,
+    )
+    if staged.storage_offset() != 0:
+        raise RuntimeError("NPU EPLB staging tensor must have storage_offset=0")
+    if torch_npu.get_npu_format(staged) != source_format:
+        raise RuntimeError("NPU EPLB staging changed the tensor format")
+    return staged
+
+
+def _stage_npu_p2p_ops(
+    p2p_ops: List[P2POp],
+) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Replace nonzero-offset NPU expert views with offset-zero P2P buffers."""
+    staged_ops = []
+    recv_copy_infos = []
+    staged_send_tensors = {}
+    for op in p2p_ops:
+        tensor = op.tensor
+        if not _needs_npu_p2p_staging(tensor):
+            staged_ops.append(op)
+            continue
+
+        if op.op == torch.distributed.irecv:
+            staged_tensor = _new_npu_offset_zero_staging_like(tensor)
+            recv_copy_infos.append((staged_tensor, tensor))
+        elif op.op == torch.distributed.isend:
+            send_key = (
+                tensor.device,
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            staged_tensor = staged_send_tensors.get(send_key)
+            if staged_tensor is None:
+                staged_tensor = _new_npu_offset_zero_staging_like(tensor)
+                _copy_expert_tensor_(staged_tensor, tensor)
+                staged_send_tensors[send_key] = staged_tensor
+        else:
+            raise ValueError(f"Unsupported P2P operation: {op.op}")
+
+        staged_ops.append(
+            P2POp(
+                op=op.op,
+                tensor=staged_tensor,
+                peer=op.peer,
+                group=op.group,
+                tag=op.tag,
+            )
+        )
+    return staged_ops, recv_copy_infos
+
+
+def _copy_staged_p2p_recvs(
+    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    for staged_tensor, destination_tensor in recv_copy_infos:
+        _copy_expert_tensor_(destination_tensor, staged_tensor)
+
+
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -272,8 +361,9 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
-                        _get_tensor(routed_experts_weights, i, src_expert_location)
+                    _copy_expert_tensor_(
+                        _get_tensor(temp_buffers, i, dst_expert_location),
+                        _get_tensor(routed_experts_weights, i, src_expert_location),
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -498,9 +588,14 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
+                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
+                _copy_staged_p2p_recvs(recv_copy_infos)
+                if reqs:
+                    del req
+                del reqs, recv_copy_infos, batch_ops
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
@@ -508,9 +603,14 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _get_tensor(
-                    routed_experts_weights, i, routed_experts_weights_expert_location
-                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
+                _copy_expert_tensor_(
+                    _get_tensor(
+                        routed_experts_weights,
+                        i,
+                        routed_experts_weights_expert_location,
+                    ),
+                    _get_tensor(temp_buffers, i, temp_buffers_expert_location),
+                )
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
