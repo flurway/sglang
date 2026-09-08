@@ -217,22 +217,25 @@ def _new_npu_offset_zero_staging_like(tensor: torch.Tensor) -> torch.Tensor:
     return staged
 
 
-def _stage_npu_p2p_ops(
-    p2p_ops: List[P2POp],
-) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
-    """Replace nonzero-offset NPU expert views with offset-zero P2P buffers."""
+def _stage_npu_p2p_ops(p2p_ops):
     staged_ops = []
+    send_copy_infos = []
     recv_copy_infos = []
     staged_send_tensors = {}
+
     for op in p2p_ops:
         tensor = op.tensor
+
         if not _needs_npu_p2p_staging(tensor):
             staged_ops.append(op)
             continue
 
         if op.op == torch.distributed.irecv:
             staged_tensor = _new_npu_offset_zero_staging_like(tensor)
-            recv_copy_infos.append((staged_tensor, tensor))
+
+            # destination <- source
+            recv_copy_infos.append((tensor, staged_tensor))
+
         elif op.op == torch.distributed.isend:
             send_key = (
                 tensor.device,
@@ -243,10 +246,14 @@ def _stage_npu_p2p_ops(
                 tensor.dtype,
             )
             staged_tensor = staged_send_tensors.get(send_key)
+
             if staged_tensor is None:
                 staged_tensor = _new_npu_offset_zero_staging_like(tensor)
-                _copy_expert_tensor_(staged_tensor, tensor)
                 staged_send_tensors[send_key] = staged_tensor
+
+                # destination <- source
+                send_copy_infos.append((staged_tensor, tensor))
+
         else:
             raise ValueError(f"Unsupported P2P operation: {op.op}")
 
@@ -259,14 +266,13 @@ def _stage_npu_p2p_ops(
                 tag=op.tag,
             )
         )
-    return staged_ops, recv_copy_infos
+
+    return staged_ops, send_copy_infos, recv_copy_infos
 
 
-def _copy_staged_p2p_recvs(
-    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
-) -> None:
-    for staged_tensor, destination_tensor in recv_copy_infos:
-        _copy_expert_tensor_(destination_tensor, staged_tensor)
+def _copy_expert_tensors_(copy_infos):
+    for destination, source in copy_infos:
+        _copy_expert_tensor_(destination, source)
 
 
 def update_expert_weights_single_layer(
@@ -588,14 +594,12 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
+                batch_ops, send_copies, recv_copies = _stage_npu_p2p_ops(batch_ops)
+                _copy_expert_tensors_(send_copies)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
-                _copy_staged_p2p_recvs(recv_copy_infos)
-                if reqs:
-                    del req
-                del reqs, recv_copy_infos, batch_ops
+                _copy_expert_tensors_(recv_copies)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
@@ -604,11 +608,7 @@ def update_expert_weights_single_layer(
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
                 _copy_expert_tensor_(
-                    _get_tensor(
-                        routed_experts_weights,
-                        i,
-                        routed_experts_weights_expert_location,
-                    ),
+                    _get_tensor(routed_experts_weights, i, routed_experts_weights_expert_location),
                     _get_tensor(temp_buffers, i, temp_buffers_expert_location),
                 )
 

@@ -107,17 +107,21 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
                 "_new_npu_offset_zero_staging_like",
                 return_value=staged,
             ),
-            patch.object(expert_location_updater, "_copy_expert_tensor_") as copy,
         ):
-            staged_ops, recv_copy_infos = expert_location_updater._stage_npu_p2p_ops(
-                [op]
+            staged_ops, send_copy_infos, recv_copy_infos = (
+                expert_location_updater._stage_npu_p2p_ops([op])
             )
-            expert_location_updater._copy_staged_p2p_recvs(recv_copy_infos)
 
         self.assertIs(staged_ops[0].tensor, staged)
         self.assertEqual(staged_ops[0].peer, 2)
         self.assertIs(staged_ops[0].group, group)
         self.assertEqual(staged_ops[0].tag, 11)
+        self.assertEqual(send_copy_infos, [])
+        self.assertEqual(recv_copy_infos, [(original, staged)])
+
+        with patch.object(expert_location_updater, "_copy_expert_tensor_") as copy:
+            expert_location_updater._copy_expert_tensors_(recv_copy_infos)
+
         copy.assert_called_once_with(original, staged)
 
     def test_multicast_reuses_one_staged_send_tensor(self):
@@ -135,16 +139,20 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
                 "_new_npu_offset_zero_staging_like",
                 return_value=staged,
             ) as new_staging,
-            patch.object(expert_location_updater, "_copy_expert_tensor_") as copy,
         ):
-            staged_ops, recv_copy_infos = expert_location_updater._stage_npu_p2p_ops(
-                ops
+            staged_ops, send_copy_infos, recv_copy_infos = (
+                expert_location_updater._stage_npu_p2p_ops(ops)
             )
 
         new_staging.assert_called_once_with(original)
-        copy.assert_called_once_with(staged, original)
         self.assertIs(staged_ops[0].tensor, staged_ops[1].tensor)
+        self.assertEqual(send_copy_infos, [(staged, original)])
         self.assertEqual(recv_copy_infos, [])
+
+        with patch.object(expert_location_updater, "_copy_expert_tensor_") as copy:
+            expert_location_updater._copy_expert_tensors_(send_copy_infos)
+
+        copy.assert_called_once_with(staged, original)
 
     def test_weight_update_uses_staged_buffers(self):
         routed_expert_weights = [
@@ -157,6 +165,7 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
         ]
         temp_buffers = [torch.empty_like(routed_expert_weights[0])]
         observed_ops = []
+        observed_send_payloads = []
 
         class FakeRequest:
             def __init__(self, op):
@@ -168,6 +177,9 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
 
         def fake_batch_isend_irecv(ops):
             observed_ops.extend(ops)
+            observed_send_payloads.extend(
+                op.tensor.clone() for op in ops if op.op == torch.distributed.isend
+            )
             return [FakeRequest(op) for op in ops]
 
         with (
@@ -211,6 +223,10 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
 
         self.assertEqual(len(observed_ops), 2)
         self.assertTrue(all(op.tensor.storage_offset() == 0 for op in observed_ops))
+        self.assertEqual(len(observed_send_payloads), 1)
+        self.assertTrue(
+            torch.equal(observed_send_payloads[0], torch.tensor([3.0, 4.0]))
+        )
         self.assertTrue(
             torch.equal(
                 routed_expert_weights[0],

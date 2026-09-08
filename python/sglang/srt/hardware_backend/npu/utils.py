@@ -203,23 +203,19 @@ def npu_format_cast(
 def copy_npu_formatted_tensor_(
     destination: torch.Tensor, source: torch.Tensor
 ) -> torch.Tensor:
-    """Copy between matching NPU internal-format tensor views.
+    """Copy raw storage between matching NPU-formatted tensor views.
 
-    ``copy_memory_`` requires an offset-zero tensor descriptor. Expert weights
-    are leading-dimension views of a larger formatted tensor, so build temporary
-    descriptors that point at the exact source and destination expert slots.
+    For padded NPU formats, ``copy_memory_`` requires tensors with zero
+    storage offset. Create temporary offset-zero descriptors and redirect
+    them to the exact source and destination view addresses before copying.
+    This preserves the NPU format and performs no format conversion.
     """
     if destination.device.type != "npu" or source.device.type != "npu":
         raise ValueError("formatted NPU copy requires two NPU tensors")
-    if (
-        destination.shape != source.shape
-        or destination.dtype != source.dtype
-        or destination.device != source.device
-    ):
+    if destination.shape != source.shape:
         raise ValueError(
-            "formatted NPU copy requires matching tensors: "
-            f"destination={destination.shape}/{destination.dtype}/{destination.device} "
-            f"source={source.shape}/{source.dtype}/{source.device}"
+            f"formatted NPU copy requires matching shapes: "
+            f"destination={destination.shape}, source={source.shape}"
         )
 
     import torch_npu
