@@ -101,29 +101,50 @@ class EPLBManager:
 
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_npu_fault = (
+            self._server_args.device == "npu"
+            and self._server_args.enable_fault_tolerance
+            and self._server_args.elastic_ep_backend == "mc2"
+            and elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None and not recovering_from_npu_fault
+        )
 
         if enable_timing:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if recovering_from_npu_fault:
+            expert_location_metadata = ExpertLocationMetadata.init_for_fault_recovery(
+                self._server_args,
+                get_global_expert_location_metadata(),
+                elastic_ep_state.active_ranks_cpu,
+                moe_ep_rank=self._ps.tp_rank,
+            )
+        else:
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
+            logical_count = dump_record_output["logical_count"]
+            average_utilization_rate_over_window = dump_record_output[
+                "average_utilization_rate_over_window"
+            ]
 
-        # Check whether rebalancing is needed
-        if not force and not self._check_rebalance_needed(
-            average_utilization_rate_over_window
-        ):
-            return
+            # Check whether rebalancing is needed
+            if not force and not self._check_rebalance_needed(
+                average_utilization_rate_over_window
+            ):
+                return
 
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_config, logical_count
-        )
+            expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
+                self._server_args, self._model_config, logical_count
+            )
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
